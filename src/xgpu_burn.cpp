@@ -21,8 +21,11 @@
 #include <cstring>
 #include <dirent.h>
 #include <fstream>
+#include <limits.h>
+#include <stdlib.h>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -172,6 +175,16 @@ static std::string pci_hint(const sycl::device& d) {
 static std::string read_file(const std::string& path) {
     std::ifstream f(path);
     if (!f) return {};
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string s = ss.str();
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    return s;
+}
+
+static std::string first_line(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return {};
     std::string s;
     std::getline(f, s);
     return s;
@@ -190,9 +203,18 @@ static double read_num(const std::string& path) {
 struct HwmonCard {
     std::string drm;     // cardN
     std::string pci;     // 0000:xx:yy.z
-    std::string hwmon;   // /sys/class/drm/cardN/device/hwmon/hwmonX
+    std::string hwmon;   // /sys/class/hwmon/hwmonX or drm .../hwmon/hwmonX
     std::string device_id;
+    std::string freq_path;
 };
+
+static std::string first_existing(const std::vector<std::string>& paths) {
+    for (auto& p : paths) {
+        std::ifstream f(p);
+        if (f) return p;
+    }
+    return {};
+}
 
 static std::vector<HwmonCard> scan_hwmon() {
     std::vector<HwmonCard> cards;
@@ -201,24 +223,29 @@ static std::vector<HwmonCard> scan_hwmon() {
     while (auto* ent = readdir(drm)) {
         std::string name = ent->d_name;
         if (!starts_with(name, "card")) continue;
-        // skip card0-DP-1 etc
         if (name.find('-') != std::string::npos) continue;
         std::string base = "/sys/class/drm/" + name + "/device";
         std::string vendor = read_file(base + "/vendor");
         if (vendor.find("0x8086") == std::string::npos) continue;
+        // Skip integrated GPUs when discrete B60s are present (0xe211).
+        std::string devid = first_line(base + "/device");
         HwmonCard c;
         c.drm = name;
-        c.device_id = read_file(base + "/device");
-        c.pci = read_file(base + "/uevent");
-        // PCI_SLOT_NAME=0000:01:00.0
-        auto pos = c.pci.find("PCI_SLOT_NAME=");
+        c.device_id = devid;
+        std::string uevent = read_file(base + "/uevent");
+        auto pos = uevent.find("PCI_SLOT_NAME=");
         if (pos != std::string::npos) {
-            auto line = c.pci.substr(pos + 14);
-            auto nl = line.find('\n');
+            auto line = uevent.substr(pos + 14);
+            auto nl = line.find_first_of("\r\n");
             c.pci = line.substr(0, nl);
         } else {
             c.pci = name;
         }
+
+        char card_real[PATH_MAX];
+        std::string card_dev;
+        if (realpath(base.c_str(), card_real)) card_dev = card_real;
+
         DIR* hm = opendir((base + "/hwmon").c_str());
         if (hm) {
             while (auto* h = readdir(hm)) {
@@ -230,29 +257,102 @@ static std::vector<HwmonCard> scan_hwmon() {
             }
             closedir(hm);
         }
+        {
+            DIR* cls = opendir("/sys/class/hwmon");
+            if (cls) {
+                while (auto* h = readdir(cls)) {
+                    std::string hn = h->d_name;
+                    if (!starts_with(hn, "hwmon")) continue;
+                    std::string hp = std::string("/sys/class/hwmon/") + hn;
+                    std::string nm = first_line(hp + "/name");
+                    if (nm != "xe" && nm != "i915") continue;
+                    char hreal[PATH_MAX];
+                    std::string href = hp + "/device";
+                    bool same = false;
+                    if (!card_dev.empty() && realpath(href.c_str(), hreal))
+                        same = (card_dev == hreal);
+                    if (!same) {
+                        std::string slot = read_file(href + "/uevent");
+                        if (!c.pci.empty() && slot.find(c.pci) != std::string::npos)
+                            same = true;
+                    }
+                    if (same) {
+                        c.hwmon = hp;
+                        break;
+                    }
+                }
+                closedir(cls);
+            }
+        }
+
+        c.freq_path = first_existing({
+            base + "/tile0/gt0/freq0/cur_freq",
+            base + "/gt/gt0/freq0_cur_freq",
+            base + "/gt/gt0/freq0/cur_freq",
+            "/sys/class/drm/" + name + "/gt_cur_freq_mhz",
+            base + "/gt_cur_freq_mhz",
+        });
         cards.push_back(c);
     }
     closedir(drm);
+
+    // Prefer discrete B60 (0xe211) if mixed with iGPU
+    std::vector<HwmonCard> dgpu;
+    for (auto& c : cards)
+        if (c.device_id.find("e211") != std::string::npos ||
+            c.device_id.find("E211") != std::string::npos)
+            dgpu.push_back(c);
+    if (!dgpu.empty()) return dgpu;
     return cards;
 }
 
 static Telemetry read_telemetry(const HwmonCard& c) {
     Telemetry t;
-    if (c.hwmon.empty()) return t;
-    // temp1 usually GPU core; temp2 often memory if present
-    double t1 = read_num(c.hwmon + "/temp1_input");
-    double t2 = read_num(c.hwmon + "/temp2_input");
-    if (t1 > 0) t.temp_c = t1 / 1000.0;
-    if (t2 > 0) t.mem_temp_c = t2 / 1000.0;
-    double pavg = read_num(c.hwmon + "/power1_average");
-    double pinput = read_num(c.hwmon + "/power1_input");
-    if (pavg > 0) t.power_w = pavg / 1e6;
-    else if (pinput > 0) t.power_w = pinput / 1e6;
-    // Xe current freq
-    std::string freq_path = "/sys/class/drm/" + c.drm + "/device/gt/gt0/freq0_cur_freq";
-    double f = read_num(freq_path);
-    if (f < 0) f = read_num("/sys/class/drm/" + c.drm + "/gt_cur_freq_mhz");
-    if (f > 0) t.freq_mhz = f;
+    if (!c.hwmon.empty()) {
+        // Xe on Battlemage: temp2 package, temp3 VRAM on some kernels;
+        // temp1 may be missing or labeled unused.
+        for (int i = 2; i <= 17; ++i) {
+            double v = read_num(c.hwmon + "/temp" + std::to_string(i) + "_input");
+            if (v <= 0) continue;
+            v /= 1000.0;
+            if (v < 1.0 || v > 120.0) continue;
+            std::string lab = first_line(c.hwmon + "/temp" + std::to_string(i) + "_label");
+            if (t.temp_c < 0 || v > t.temp_c) t.temp_c = v;
+            if (lab.find("vram") != std::string::npos ||
+                lab.find("mem") != std::string::npos || i == 3)
+                t.mem_temp_c = v;
+        }
+        double pavg = read_num(c.hwmon + "/power1_average");
+        if (pavg < 0) pavg = read_num(c.hwmon + "/power2_average");
+        double pinput = read_num(c.hwmon + "/power1_input");
+        if (pinput < 0) pinput = read_num(c.hwmon + "/power2_input");
+        if (pavg > 0) t.power_w = pavg / 1e6;
+        else if (pinput > 0) t.power_w = pinput / 1e6;
+        else {
+            // Instantaneous power often missing; derive W from energy µJ.
+            static std::mutex mu;
+            static std::map<std::string, std::pair<double, uint64_t>> prev;
+            double e = read_num(c.hwmon + "/energy1_input");
+            if (e < 0) e = read_num(c.hwmon + "/energy2_input");
+            if (e > 0) {
+                auto now = std::chrono::steady_clock::now().time_since_epoch();
+                double sec = std::chrono::duration<double>(now).count();
+                std::lock_guard<std::mutex> g(mu);
+                auto it = prev.find(c.pci.empty() ? c.drm : c.pci);
+                uint64_t eu = uint64_t(e);
+                if (it != prev.end()) {
+                    double dt = sec - it->second.first;
+                    uint64_t de = eu - it->second.second;
+                    if (dt > 0.2) t.power_w = (double(de) / dt) / 1e6;
+                }
+                prev[c.pci.empty() ? c.drm : c.pci] = {sec, eu};
+            }
+        }
+    }
+    if (!c.freq_path.empty()) {
+        double f = read_num(c.freq_path);
+        if (f > 0) t.freq_mhz = f;
+    }
     return t;
 }
 
@@ -352,9 +452,14 @@ void burn_typed(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget
     }
     size_t nC = (budget - 2 * mat_bytes) / mat_bytes;
     if (nC < 2) nC = 2;
-    if (nC > 64) nC = 64; // enough slots to keep VRAM hot without huge compare cost
+    // Compare only uses C[0] vs C[1]; extra slots exist to occupy VRAM.
+    if (nC > 512) nC = 512;
 
-    st.used_bytes.store(mat_bytes * (2 + nC));
+    size_t used = mat_bytes * (2 + nC);
+    size_t leftover = budget > used + (8ull << 20) ? budget - used : 0;
+    leftover &= ~size_t(4095);
+
+    st.used_bytes.store(used + leftover);
     st.n.store(n);
 
     T* A = sycl::malloc_device<T>(elems, q);
@@ -362,6 +467,7 @@ void burn_typed(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget
     std::vector<T*> C(nC);
     for (size_t i = 0; i < nC; ++i) C[i] = sycl::malloc_device<T>(elems, q);
     int* faults = sycl::malloc_device<int>(1, q);
+    char* scratch = leftover ? sycl::malloc_device<char>(leftover, q) : nullptr;
     if (!A || !B || !faults) {
         std::cerr << "Device malloc failed\n";
         return;
@@ -379,6 +485,7 @@ void burn_typed(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget
     q.memcpy(A, hA.data(), mat_bytes).wait();
     q.memcpy(B, hB.data(), mat_bytes).wait();
     q.memset(faults, 0, sizeof(int)).wait();
+    if (scratch) q.memset(scratch, 0x5A, leftover).wait();
 
     const T alpha = T(1);
     const T beta = T(0);
@@ -404,15 +511,23 @@ void burn_typed(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget
     do_gemm(C[0]).wait();
     local_iters++;
 
+    const int inflight = 8;
     while (!g_stop.load()) {
-        slot = (slot + 1) % nC;
-        if (slot == 0) slot = 1;
-        do_gemm(C[slot]).wait();
-        local_iters++;
+        for (int k = 0; k < inflight; ++k) {
+            slot = (slot + 1) % nC;
+            if (slot == 0) slot = 1;
+            do_gemm(C[slot]);
+            local_iters++;
+        }
+        // Keep GDDR6 busy with a bulk copy of leftover VRAM.
+        if (scratch && leftover >= 2 * (8ull << 20)) {
+            size_t half = leftover / 2;
+            q.memcpy(scratch + half, scratch, half);
+        }
+        q.wait();
 
-        // Compare every few iterations so we catch silent compute errors
-        if ((local_iters % 8) == 0) {
-            compare_results<T>(q, C[0], C[slot], elems, faults, eps).wait();
+        if ((local_iters % 32) < size_t(inflight)) {
+            compare_results<T>(q, C[0], C[1], elems, faults, eps).wait();
             int f = 0;
             q.memcpy(&f, faults, sizeof(int)).wait();
             if (f) {
@@ -432,6 +547,7 @@ void burn_typed(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget
     sycl::free(A, q);
     sycl::free(B, q);
     for (auto* p : C) sycl::free(p, q);
+    if (scratch) sycl::free(scratch, q);
     sycl::free(faults, q);
 }
 
@@ -445,8 +561,11 @@ void burn_bf16(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget)
     if (budget < mat_bytes * 3) return;
     size_t nC = (budget - 2 * mat_bytes) / mat_bytes;
     if (nC < 2) nC = 2;
-    if (nC > 64) nC = 64;
-    st.used_bytes.store(mat_bytes * (2 + nC));
+    if (nC > 512) nC = 512;
+    size_t used = mat_bytes * (2 + nC);
+    size_t leftover = budget > used + (8ull << 20) ? budget - used : 0;
+    leftover &= ~size_t(4095);
+    st.used_bytes.store(used + leftover);
     st.n.store(n);
 
     bf16* A = sycl::malloc_device<bf16>(elems, q);
@@ -454,6 +573,7 @@ void burn_bf16(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget)
     std::vector<bf16*> C(nC);
     for (size_t i = 0; i < nC; ++i) C[i] = sycl::malloc_device<bf16>(elems, q);
     int* faults = sycl::malloc_device<int>(1, q);
+    char* scratch = leftover ? sycl::malloc_device<char>(leftover, q) : nullptr;
 
     std::vector<float> hAf(elems), hBf(elems);
     fill_host(hAf, 0xA5A5u);
@@ -466,6 +586,7 @@ void burn_bf16(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget)
     q.memcpy(A, hA.data(), mat_bytes).wait();
     q.memcpy(B, hB.data(), mat_bytes).wait();
     q.memset(faults, 0, sizeof(int)).wait();
+    if (scratch) q.memset(scratch, 0x5A, leftover).wait();
 
     const bf16 alpha = bf16(1.0f);
     const bf16 beta = bf16(0.0f);
@@ -476,14 +597,21 @@ void burn_bf16(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget)
     mkl_gemm<bf16>(q, n, alpha, A, B, beta, C[0], {}).wait();
     local_iters++;
 
+    const int inflight = 8;
     while (!g_stop.load()) {
-        slot = (slot + 1) % nC;
-        if (slot == 0) slot = 1;
-        mkl_gemm<bf16>(q, n, alpha, A, B, beta, C[slot], {}).wait();
-        local_iters++;
-        if ((local_iters % 8) == 0) {
-            // Compare in float domain on device
-            compare_results<bf16>(q, C[0], C[slot], elems, faults, bf16(0.25f)).wait();
+        for (int k = 0; k < inflight; ++k) {
+            slot = (slot + 1) % nC;
+            if (slot == 0) slot = 1;
+            mkl_gemm<bf16>(q, n, alpha, A, B, beta, C[slot], {});
+            local_iters++;
+        }
+        if (scratch && leftover >= 2 * (8ull << 20)) {
+            size_t half = leftover / 2;
+            q.memcpy(scratch + half, scratch, half);
+        }
+        q.wait();
+        if ((local_iters % 32) < size_t(inflight)) {
+            compare_results<bf16>(q, C[0], C[1], elems, faults, bf16(0.25f)).wait();
             int f = 0;
             q.memcpy(&f, faults, sizeof(int)).wait();
             if (f) {
@@ -500,6 +628,7 @@ void burn_bf16(sycl::queue& q, const Options& opt, GpuStatus& st, size_t budget)
     sycl::free(A, q);
     sycl::free(B, q);
     for (auto* p : C) sycl::free(p, q);
+    if (scratch) sycl::free(scratch, q);
     sycl::free(faults, q);
 }
 #endif
@@ -511,8 +640,8 @@ static void burn_one(sycl::device dev, const Options& opt, GpuStatus& st) {
         size_t budget = opt.mem_mb > 0 ? size_t(opt.mem_mb) * 1024ull * 1024ull
                                        : size_t(opt.mem_frac * double(global));
         // Leave a little headroom for runtime / kernels
-        if (budget > global - (256ull << 20) && global > (256ull << 20))
-            budget = global - (256ull << 20);
+        if (budget > global - (128ull << 20) && global > (128ull << 20))
+            budget = global - (128ull << 20);
 
         st.alive.store(1);
         switch (opt.prec) {
@@ -601,6 +730,7 @@ int main(int argc, char** argv) {
                 auto t = read_telemetry(c);
                 std::cout << "  " << c.drm << "  pci=" << c.pci
                           << "  id=" << c.device_id
+                          << "  hwmon=" << (c.hwmon.empty() ? "(none)" : c.hwmon)
                           << "  T=" << t.temp_c << "C  P=" << t.power_w << "W"
                           << "  f=" << t.freq_mhz << "MHz\n";
             }
