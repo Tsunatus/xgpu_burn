@@ -83,8 +83,13 @@ fi
 
 echo
 echo "-- sycl-ls --"
+# Restrict SYCL to Level Zero GPUs so OpenCL does not double-count
+# the same B60 as a second device (looks like GPU 0 + GPU 1, both card 0).
+unset ZE_AFFINITY_MASK || true
+export ZE_FLAT_DEVICE_HIERARCHY="${ZE_FLAT_DEVICE_HIERARCHY:-FLAT}"
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:gpu}"
 if command -v sycl-ls >/dev/null; then
-    ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:*}" sycl-ls || true
+    sycl-ls || true
 else
     log "WARNING: sycl-ls not in PATH"
 fi
